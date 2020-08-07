@@ -1,0 +1,472 @@
+require("dplyr")
+require("tidyr")
+require("readxl")
+require("stringr")
+require("lubridate")
+require("mice")
+
+options(stringsAsFactors = F)
+
+recalculate_all <- F
+
+
+#####################
+# Custom functions
+
+tfences <- function(x, k = 1.5, one.sided = F, printValues = F){
+  qtls <- quantile(x, names = F, na.rm = T)
+  iqr <- IQR(x)
+  if (printValues){
+    print(qtls[2]-k*iqr)
+    print(qtls[4]+k*iqr)
+  }
+  if (one.sided){
+    ext <- (x < qtls[2]-k*iqr)
+  } else {
+    ext <- (x < qtls[2]-k*iqr) | (x > qtls[4]+k*iqr)
+  }
+  return(ext)
+}
+
+# Galtons measure of skewness (robust)
+Galton <- function(x){
+  if (length(x) < 3){
+    return (0)
+  } else {
+    qntls <- quantile(x, probs = seq(0,1,0.25), names = F, na.rm = T)
+    res <- ((qntls[4] - qntls[3]) - (qntls[3] - qntls[2])) / 
+      (qntls[4] - qntls[2])
+    if(is.nan(res)){
+      return (0)
+    } else {
+      return (res)
+    }
+  }
+}
+
+# Robust measure of kurosis
+kurt <- function(x){
+  if (length(x) < 3){
+    return (0)
+  } else {
+    qntls1 <- quantile(x, probs = seq(0,1,0.1), names = F, na.rm = T)
+    qntls2 <- quantile(x, probs = seq(0,1,0.25), names = F, na.rm = T)
+    res <- ((qntls1[8] - qntls1[6]) + (qntls1[3] - qntls1[2])) /
+             (qntls2[4] - qntls2[2])
+  }
+  if(is.nan(res)){
+    return (0)
+  } else {
+    return (res)
+  }
+}
+
+#####################
+# Data loading
+
+# Read in All Lead samples
+all_lead <-  read_xls("Data/SW - All Lead WQ Samples (2010-18).xls", 
+                      sheet = "Report1", na = "NA", guess_max = 2500000)
+
+# Read in community pipe data
+# Note that BB3351 - BG3355 contains faulty data and the columns are removed
+comm <- read_xls("Data/SW - Comm pipe data.xls", sheet = "Survey Results", na = "NA", guess_max = 2500000) %>%
+  select(colnames(.)[1:49])
+comm2 <- read_xls("Data/SW - Comm pipe data.xls", sheet = "Superseded", na = "NA", guess_max = 2500000, skip = 1)
+
+#Read in Phosphate Dosing WTWs
+phod_WTW <- read_xlsx("Data/SW - Phosphate Dosing WTWs Y or N.xlsx", 
+                      sheet = "Phosphate Dosing WTWs Overview", na = "NA", guess_max = 2500000)
+
+# Read in Postcodes to SW Zone
+# Note that the file format has been changed in Excel ".xlsb -> .xlsx"
+# Also note that the last column was reformated in Excel to a number
+pc2zone <- read_xlsx("Data/SW - Postcodes linked to SW Zonal Structure.xlsx", 
+                     sheet = "Postcodes", na = "NA", guess_max = 2500000)
+
+# Read in WZ Phosphate levels
+wzpho <- read_xls("Data/SW - Scottish Water Zonal Phosphate Levels.xls", 
+                  sheet = "Sheet1",na = "NA", guess_max = 2500000)
+
+# Read in postcode household data
+pchh <- read.csv("Data/Other - Postcode_ household count_ urban class.csv", check.names = F)
+
+# Read in HPI data
+hpi <- read.csv("Data/Other - UK-HPI-full-file-2019-03.csv", check.names = F)
+
+# Read in Comm pipe replacements
+cmrp <- read.csv("Data/SW - Lead Comm Pipe Replacements (2004-2018).csv", check.names = F)
+
+# Read in Property age
+# Note that the data was split into two parts, since Github had a file size limit
+propAge <- read.csv("Data/Other - SAA_PropertyAgeData1.csv", check.names = F) %>%
+  base::rbind(read.csv("Data/Other - SAA_PropertyAgeData2.csv", check.names = F))
+
+# Read in GDHIpp data
+gdhi <- read_xls("Extra Data/regionalgrossdisposablehouseholdincomelocalauthorityukmscotland.xls",
+                  sheet = "Table 2", skip = 1)
+
+# Read in population data
+pop <- read_xls("Extra Data/ukmidyearestimates20192020ladcodes.xls",
+                  sheet = "MYE2 - Persons", skip = 4)
+
+
+#####################
+# Data manipulation
+
+# Lead samples
+if (!file.exists("Extra Data/all_leadM.csv") | recalculate_all){
+  # Remove all the spaces in postcodes, for uniformity
+  # Remove useless variables, that either contain no information or contain duplicate information
+  # Eastings and Northings removed, since they are coordinates
+  # Filter rows without a postcode or without results
+  # Create a variable for understanding whether the sample was gathered during summer or winter
+  # For each observation, create another one that calculates the total
+  # Summarise the test results for the two seasons, and total, over each postcode
+  # Make seperate columns for them so that each postcode has one row of data
+  all_leadM <- all_lead %>%
+    mutate(`Street Postcode` = gsub(" ", "", `Street Postcode`)) %>%
+    select(-`Sample Point Matrix`, -`Det Test Description`, -`Det Unit Display String`,
+           -`Sample Date`, -`Sample Date - Year`, -`Sample Template`, -`Result Status Description`,
+           -Eastings, -Northings, -`DMA Name`, -`DMA Id`, -`RSZ Name`, -`RSZ Id`, 
+           -`RSZ Water System Id`, -`RSZ Water System Name`, -`District Postcode`, -`Region Name 2006`,
+           -`WOA Name`, -`WOA Id`, -`WSZ Name`, -`WSZ Id`, -`Site Name`) %>%
+    filter(`Street Postcode` != "",
+           !is.na(`Result Numeric Entry`)) %>%
+    mutate(sample_season = if_else(`Sample Date - Month` %in% c("Oct", "Nov", "Dec", "Jan", "Feb", "Mar"),
+                                   "Winter", "Summer"),
+           `Result Numeric Entry` = log(`Result Numeric Entry`)) %>%
+    slice(rep(1:n(), each = 2)) %>%
+    mutate(sample_season = if_else(duplicated(.), "Total", sample_season)) %>%
+    select(-`Sample Date - Month`, -`Sample Date Timestamp`) %>%
+    group_by_at(vars(-`Result Numeric Entry`)) %>%
+    summarise(`Samples Num` = n(),
+              `Samples Result Median` = median(`Result Numeric Entry`),
+              `Samples Result MAD` = mad(`Result Numeric Entry`),
+              `Samples Result Skewness` = Galton(`Result Numeric Entry`),
+              `Samples Result Kurtosis` = kurt(`Result Numeric Entry`)) %>%
+    pivot_wider(names_from = sample_season, values_from = c(`Samples Num`, `Samples Result Median`, 
+                                                            `Samples Result MAD`, `Samples Result Skewness`,
+                                                            `Samples Result Kurtosis`),
+                names_glue = "{sample_season} {.value}", values_fill = 0)
+  
+  write.csv2(all_leadM, "Extra Data/all_leadM.csv", row.names = F)
+} else {
+  all_leadM <- read.csv2("Extra Data/all_leadM.csv", check.names = F)
+}
+
+# Community pipelines
+if (!file.exists("Extra Data/comm2M.csv") | recalculate_all){
+  # Filter data that can't be attributed to any RSZ
+  # Select important columns and rename them
+  comm2M <- comm2 %>%
+    filter(!is.na(RZ_REF)) %>%
+    select(1,3:6,12:13) %>%
+    rename("RSZ_ID" = RZ_REF,
+           "RSZ_Total pipes" = `Total no. of Comms Pipes`,
+           "RSZ_Pre 1970 pipes" = `Nr of Comms Pipes\nPre 1970`,
+           "RSZ_Pre 1970 reg lead" = `Nr of Comms Pipes Pre 1970:\nLead in Register`,
+           "RSZ_Post 1970 reg lead" = `Nr of Comms Pipes Post 1970:\nLead in Register`,
+           "RSZ_Pipes tested total" = `Nr of samples taken`,
+           "RSZ_Pipes tested lead" = `Nr of Lead Comms Found`) %>%
+    mutate("RSZ_Post 1970 pipes" = `RSZ_Total pipes` - `RSZ_Pre 1970 pipes`) %>%
+    select(1,3,8,4:7)
+  
+  write.csv2(comm2M, "Extra Data/comm2M.csv", row.names = F)
+} else {
+  comm2M <- read.csv2("Extra Data/comm2M.csv", check.names = F)
+}
+
+# Community pipe replacements
+if (!file.exists("Extra Data/cmrpM.csv") | recalculate_all){
+  # Select only the informative columns
+  # Define that a job is counted as complete, if the word 'complete' appears in the status
+  # Summarise over all of the WOAs
+  # Rename some WOAs for uniformity
+  cmrpM <- cmrp %>%
+    select(`WO Completed Status`, `Street postcode`, WOA_Name = `Ads Water Operational Area`) %>%
+    filter(!is.na(`WO Completed Status`)) %>%
+    mutate(Completed = grepl("[Cc]omplete", `WO Completed Status`)) %>%
+    group_by(WOA_Name) %>%
+    summarise(`WOA_Pipe replacement jobs total` = n(),
+              `WOA_Pipe replacement jobs complete` = sum(Completed)) %>%
+    mutate(WOA_Name = gsub("\\sWOA$", "", WOA_Name),
+           WOA_Name = gsub("GLENFARG", "Glenfarg", WOA_Name),
+           WOA_Name = gsub("Inveraray$", "Inverary", WOA_Name),
+           WOA_Name = gsub("Kyle Of Lochalsh$", "Kyle of Lochalsh", WOA_Name))
+  
+  write.csv2(cmrpM, "Extra Data/cmrpM.csv", row.names = F)
+} else {
+  cmrpM <- read.csv2("Extra Data/cmrpM.csv", check.names = F)
+}
+
+# Adjusting the WTW names
+if (!file.exists("Extra Data/phod_WTWM.csv") | recalculate_all){
+  # Select the two informative columns
+  # Rename some of the WTWs for uniformity
+  phod_WTWM <- phod_WTW %>%
+    select(WTW = `WTW Name`, `Phosphate Dosing` = `Phosphate Dosing on Site?`) %>%
+    mutate(WTW = gsub("\\sWTW.*", "", WTW),
+           WTW = str_to_title(WTW),
+           WTW = gsub("\\s(New).*", "", WTW),
+           `Phosphate Dosing` = (`Phosphate Dosing` == "Yes"))
+  
+  write.csv2(phod_WTWM, "Extra Data/phod_WTWM.csv", row.names = F)
+} else {
+  phod_WTWM <- read.csv2("Extra Data/phod_WTWM.csv", check.names = F)
+}
+
+# Postcodes to zone
+if(!file.exists("Extra Data/pc2zoneM.csv") | recalculate_all){
+  # Select only the informative columns
+  # Remove observations which cannot be attributed to a postcode
+  # Create a new variable from which the WTW names will be split
+  # Fix some of the names for uniformity
+  # Seperate the variable using the '&' or '-' signs
+  # Rename the WTWs for uniformity
+  pc2zoneM <- pc2zone %>%
+    select(-`District Postcode`, -DMA_ID, -DMA_Name, -...13, -...14, -Count, -`Current DMA?`, -`WOA/RSZ/WSZ?`) %>%
+    filter(!is.na(`Street Postcode`)) %>%
+    mutate(WOA_Name = gsub("\\sWOA.*", "", WOA_Name),
+           WTW = str_to_title(WOA_Name),
+           WTW = gsub("^Spey ", "", WTW),
+           WTW = gsub("\\s(North|East|West|South) Region.*", "", WTW),
+           WTW = gsub("\\s\\(.*\\)$", "", WTW),
+           WTW = gsub("\\sRegional$", "", WTW),
+           WTW = gsub("(Street)", "St", WTW),
+           WTW = gsub("Lochgoilhead", "Lochgoilhead Membrane", WTW),
+           WTW = gsub("C V", "Carron Valley", WTW),
+           WTW = gsub("Lhills", "Lomond Hills", WTW),
+           WTW = gsub("Gfarg", "Glenfarg", WTW),
+           WTW = gsub("Inverary", "Inveraray", WTW),
+           WTW = gsub("O' Turk", "O'turk", WTW),
+           WTW = gsub("Balquidder", "Balquhidder", WTW)) %>%
+    separate(WTW, c("WTW1", "WTW2", "WTW3"), "( & )|-", fill = "right", remove = T) %>%
+    mutate_at(paste0("WTW",1:3), ~ gsub("Lf$", "Larchfield", .)) %>%
+    mutate_at(paste0("WTW",1:3), ~ gsub("Inver$", "Invercannie", .)) %>%
+    mutate_at(paste0("WTW",1:3), ~ gsub("Mann$", "Mannofield", .)) %>%
+    mutate_at(paste0("WTW",1:3), ~ gsub("^Sth", "South", .))
+  
+  write.csv2(pc2zoneM, "Extra Data/pc2zoneM.csv", row.names = F)
+} else {
+  pc2zoneM <- read.csv2("Extra Data/pc2zoneM.csv", check.names = F)
+}
+
+# SWZ Phosphate levels
+if (!file.exists("Extra Data/wzphoIMF.csv") | recalculate_all){
+  # First create a list of rigs which have too few samples
+  wzphoL <- wzpho %>%
+    group_by(Rig) %>%
+    summarise(n = n()) %>%
+    filter(!tfences(n, k = 4, one.sided = T)) %>%
+    pull(Rig)
+  # Creating the actual dataset
+  wzphoM <- wzpho %>%
+    select(-`Sample Comments`, -`Sample Number`, -Region) %>%
+    filter(Rig %in% wzphoL) %>%
+    rename(Hydrogen = `Hydrogen ion`, Date = `Sample Date`) %>%
+    mutate(Rig = gsub("\\s\\((Raitloan|Kessock).*", "", Rig))
+  # Impute the missing data for each rig
+  # Takes some time to compute all of them
+  wzphoIM <- wzphoM %>% filter(F) # Empty dataset
+  imputations = 10
+  for (rig in unique(wzphoM$Rig)){
+    nom <- wzphoM %>% filter(Rig == rig) %>% select(Rig, Date) #Store the Date and Rig outside, since they won't be imputed
+    num <- wzphoM %>% filter(Rig == rig) %>% select(-Rig) %>% mutate(Date = as.vector(scale(as.numeric(Date)))) #
+    imputs <- mice(num, m=imputations, maxit = 100, method = "pmm")
+    
+    tot <- as.matrix(complete(imputs,1))[,-1]
+    for (i in 2:imputations){
+      tot <- tot + as.matrix(complete(imputs,i))[,-1]
+    }
+    tot <- tot / i
+    df <- base::cbind(nom, tot)
+    wzphoIM <- base::rbind(wzphoIM, df)
+  }
+  # Calculating from the final dataset
+  wzphoIMF <- wzphoIM %>%
+    mutate(Season = if_else(months(Date, abbreviate = T) %in% c("Oct", "Nov", "Dec", "Jan", "Feb", "Mar"),
+                            "Winter", "Summer")) %>%
+    group_by(Rig, Season) %>%
+    summarise_if(is.numeric, list(~ median(., na.rm = T), ~ mad(., na.rm = T), ~ Galton(.), ~ kurt(.))) %>%
+    pivot_wider(names_from = Season, values_from = colnames(.)[c(-1,-2)],
+                names_glue = "RSZ_{Season}_{.value}", values_fill = 0) %>%
+    mutate(Rig = gsub(".*\\s\\(Inschfield SR\\)", "Craigie", Rig),
+           Rig = gsub(".*\\s\\(Carberry Low SR\\)", "GLENFARG KWOODBH B", Rig),
+           Rig = gsub(".*\\s\\(Dykeneuk SR\\)", "Glendevon/Glenfarg", Rig)) %>%
+    separate(Rig, into = c("Zone", NA), sep = " [Zz]one\\s?", fill = "right", remove = T) %>%
+    mutate(Zone = gsub("St.*$", "Street", Zone),
+           Zone = gsub("Afton$", "Afton (WOA000009)", Zone),
+           Zone = gsub("Auchenfad$", "Cargen", Zone),
+           Zone = gsub("Balmore$", "Balmore A", Zone),
+           Zone = gsub("\\s\\(Peebles\\)$", "", Zone),
+           Zone = gsub("Clatto$", "Clatto East", Zone),
+           Zone = gsub("Daer$", "Daer A", Zone),
+           Zone = gsub("Glendevon$", "Glendevon A", Zone),
+           Zone = gsub("Glengap/Ringford$", "Ringford & Glengap", Zone),
+           Zone = gsub("Invercannie/Mannofield$", "Mannofield East", Zone),
+           Zone = gsub("Killicrankie$", "Killiecrankie", Zone),
+           Zone = gsub("Kyle$", "Kyle of Lochalsh", Zone),
+           Zone = gsub("Marchbank$", "Marchbank B", Zone),
+           Zone = gsub("Rosebery$", "Rosebery B (WOA000308)", Zone),
+           Zone = gsub("Toftcarl$", "Hoy Calder", Zone),
+           Zone = gsub("Turriff", "Turriff (WOA000375)", Zone))
+  
+  write.csv2(wzphoIMF, "Extra Data/wzphoIMF.csv", row.names = F)
+} else {
+  wzphoIMF <- read.csv2("Extra Data/wzphoIMF.csv", check.names = F)
+}
+
+# Postcode household data
+if (!file.exists("Extra Data/pchhM.csv") | recalculate_all){
+  # Gather only the informative data
+  # Make the date variable into Date type
+  # For each postcode, calculate when the last census data was available
+  # For each postcode, calculate when it was first and last introduced, last deleted and if it is still active
+  # Take only 1 row per postcode
+  # Pivot wider so each postcode has only 1 row of data
+  pchhM <- pchh %>%
+    select(`Street postcode`,  Intro = DateOfIntroduction, Del = DateOfDeletion, Easting = GridReferenceEasting, Northing = GridReferenceNorthing,
+           Latitude, Longitude, CouncilArea2018Code, CensusHouseholdCount2011, CensusPopulationCount2011,
+           CensusHouseholdCount2001, CensusPopulationCount2001, CensusHouseholdCount1991, CensusPopulationCount1991,
+           ScottishIndexOfMultipleDeprivation2016Rank) %>%
+    mutate(Intro = as.Date(Intro, format = "%d/%m/%Y %H:%M"),
+           Del = gsub("ND", "", Del),
+           Del = as.Date(Del, format = "%d/%m/%Y %H:%M")) %>%
+    group_by(`Street postcode`) %>%
+    arrange(desc(Intro), .by_group = T) %>%
+    fill(CensusHouseholdCount2011, CensusPopulationCount2011, CensusHouseholdCount2001, CensusPopulationCount2001, 
+         CensusHouseholdCount1991, CensusPopulationCount1991, .direction = "up") %>%
+    mutate(`First Introduction` = min(Intro),
+           `Last Introduction` = max(Intro),
+           `Last Deletion` = max(Del, na.rm = T),
+           `Currently Active` = is.na(max(Del))) %>%
+    slice(1) %>%
+    pivot_longer(cols = starts_with("Census"),
+                 names_to = c("Type", "Year"),
+                 names_pattern = "Census(.*)Count(.*)",
+                 values_to = "Count") %>%
+    group_by(`Street postcode`, Type) %>%
+    arrange(desc(Year)) %>%
+    fill(Count, .direction = "up") %>%
+    slice(1) %>%
+    pivot_wider(names_from = "Type", values_from = "Count",
+                names_glue = "Latest {Type} Count") %>%
+    select(-Intro, -Del, -Year)
+  
+  write.csv2(pchhM, "Extra Data/pchhM.csv", row.names = F)
+} else {
+  pchhM <- read.csv2("Extra Data/pchhM.csv", check.names = F)
+}
+
+# Property age
+if (!file.exists("Extra Data/propAgeM.csv") | recalculate_all){
+  # Assuming that '1981 - 1914' is a typo for '1891-1914'
+  vec_pos <- c("Post 1971")
+  vec_pre <- c("1890 and before", "1981 to 1914", "1915 to 1944", "1870 - 1900", "Inter War", "Pre 1880", "1890 - 1914",
+               "1915-1944", "1891-1914", "1890 - 1914", "1929-1939", "1945 -1962", "1870 - 1900", "1918 to 1939",
+               "1945 to 1959", "1800", "1800 to 1850", "1840-1880", "1870 to 1900", "1870 to 1914", "1890 to 1914",
+               "1900 to 1914", "1900 to 1918", "1918 to 1925", "1925 to 1930", "1930 to 1935", "1935 to 1945", 
+               "1945 to 1953", "1945 to 1960", "1945 to1953", "1953 to 1964", "1964 to 1971", "Pre 1870", "Pre-1870",
+               "1840 - 1880", "1920 - 1939 Budget House", "1850")
+  vec_nas <- c("1945 onwards", "Post 1945", "As 4 But High Quality", "As 5 But High Quality","Not Age Related - Signifies Condemned State",
+                "Post 1950 For Private Post 1960 Local Authority", "Post War 1945", "post 1960", "POST 1959", "Post 1960", 
+                "Post 1961", "Post 1962", "Post 1963", "Post 1960 Better Quality Than Class 2A", "Tenements Post 1959")
+  
+  # Remove all the spaces in postcodes, for uniformity
+  # Filter out all of the properties without postcodes
+  # Summarise over Postcodes, building types and age categories
+  # Then sort so that within groups, the types that have the highest number of properties are at the top,
+  # Then summarise over Postcodes and bring out the most prevalent building types and age categories
+  propAgeM <- propAge %>%
+    mutate(Postcode = gsub(" ", "", Postcode),
+           Age_Category = str_remove_all(Age_Category, "AgeCat: "),
+           Age_Category = str_replace_all(Age_Category, paste0("(",vec_nas, "$)", collapse = "|"), ""),
+           Age_Category = str_replace_all(Age_Category, paste0("(",vec_pos, "$)", collapse = "|"), "1971"),
+           Age_Category = str_replace_all(Age_Category, paste0("(",vec_pre, "$)", collapse = "|"), "1969"),
+           Age_Category = na_if(Age_Category, ""),
+           Age_Category = as.numeric(Age_Category),
+           Age_Year = as.numeric(Age_Year),
+           Building_Type = gsub("(#N\\/A)|(Not Available)", "Unknown", Building_Type),
+           Building_Type = if_else(Building_Type == "", "Unknown", Building_Type),
+           Building_Type = gsub("\\s{2,}|( \\W )|(\\W)", " ", Building_Type),
+           Building_Type = str_to_title(Building_Type)) %>%
+    filter(Postcode != "") %>%
+    mutate(Age = if_else(is.na(Age_Year), Age_Category, Age_Year),
+           Age_Cat = if_else(Age < 1970, "Pre 1970", "Post 1970", "Indeterminate")) %>%
+    group_by(Postcode, Age_Cat, Building_Type) %>%
+    summarise(Properties = n()) %>%
+    arrange(-Properties, .by_group = T) %>%
+    group_by(Postcode, Age_Cat) %>%
+    summarise(Properties = sum(Properties),
+              `Prevalent Building Type` = first(Building_Type)) %>%
+    pivot_wider(id_cols = Postcode, names_from = Age_Cat, values_from = c(`Properties`, `Prevalent Building Type`),
+                names_glue = "{Age_Cat} {.value}") %>%
+    mutate_at(2:4, replace_na, 0) %>%
+    mutate_at(5:7, replace_na, "None")
+  
+  write.csv2(propAgeM, "Extra Data/propAgeM.csv", row.names = F)
+} else {
+  propAgeM <- read.csv2("Extra Data/propAgeM.csv", check.names = F)
+}
+
+# HPI
+if (!file.exists("Extra Data/hpiM.csv") | recalculate_all){
+  hpiM <- hpi %>%
+    filter(CouncilArea2018Code %in% pchhM$CouncilArea2018Code) %>%
+    select(-Year2, -RegionName, -ends_with("SA"), -ends_with("Index"), -ends_with("Change")) %>%
+    mutate(Date = as.Date(Date, format = "%d/%m/%Y")) %>%
+    filter(Date >= as.Date("2018-01-01"), Date < as.Date("2019-01-01")) %>%
+    mutate(Year = year(Date)) %>%
+    group_by(CouncilArea2018Code, Year) %>%
+    mutate_at(vars(ends_with("Volume")), ~ sum(., na.rm = T)) %>%
+    select(-Date) %>%
+    group_by_at(vars(!ends_with("Price"))) %>%
+    summarise_all(list(~ median(., na.rm = T), ~ mad(., na.rm = T), ~ Galton(.), ~ kurt(.))) %>%
+    arrange(CouncilArea2018Code, Year) %>%
+    pivot_wider(names_from = c("Year"), values_from = ends_with("median") | ends_with("mad") | ends_with("Volume") | ends_with("Galton") | ends_with("kurt"),
+                names_glue = "{Year}_{.value}")
+  
+  write.csv2(hpiM, "Extra Data/hpiM.csv", row.names = F)
+} else {
+  hpiM <- read.csv2("Extra Data/hpiM.csv", check.names = F)
+}
+
+gdhiM <- gdhi %>%
+  mutate(`LAD code` = gsub("S12000050", "S12000044", `LAD code`),
+         `LAD code` = gsub("S12000049", "S12000046", `LAD code`)) %>%
+  filter(`LAD code` %in% pchhM$CouncilArea2018Code) %>%
+  select(Code = `LAD code`, GDHIph = `20181`)
+
+popM <- pop %>%
+  mutate(Code = gsub("S12000050", "S12000044", Code),
+         Code = gsub("S12000049", "S12000046", Code)) %>%
+  filter(Code %in% pchhM$CouncilArea2018Code) %>%
+  select(Code, Population = `All ages`)
+
+#####################
+# Combining data
+
+Zones <- pc2zoneM %>%
+  left_join(phod_WTWM %>% rename(`Phosphate Dosing WTW 1` = `Phosphate Dosing`), by = c("WTW1" = "WTW")) %>%
+  left_join(phod_WTWM %>% rename(`Phosphate Dosing WTW 2` = `Phosphate Dosing`), by = c("WTW2" = "WTW")) %>%
+  left_join(phod_WTWM %>% rename(`Phosphate Dosing WTW 3` = `Phosphate Dosing`), by = c("WTW3" = "WTW")) %>%
+  mutate(`Any Phosphate Dosing` = (`Phosphate Dosing WTW 1` | `Phosphate Dosing WTW 2` | `Phosphate Dosing WTW 3`),
+         `Any Phosphate Dosing` = replace_na(`Any Phosphate Dosing`, F))  %>%
+  left_join(cmrpM) %>%
+  mutate_if(is.numeric, ~ replace_na(., 0)) %>%
+  inner_join(wzphoIMF, by = c("RSZ_Name" = "Zone"))
+
+PCs <- pchhM %>%
+  rename(Postcode = `Street postcode`) %>%
+  inner_join(all_leadM, by = c("Postcode" = "Street Postcode")) %>%
+  left_join(gdhiM, by = c("CouncilArea2018Code" = "Code")) %>%
+  left_join(popM, by = c("CouncilArea2018Code" = "Code")) %>%
+  inner_join(propAgeM, by = "Postcode") %>%
+  #inner_join(commM, by = c("Postcode" = "Street postcode")) %>%
+  inner_join(Zones, by = c("Postcode" = "Street Postcode")) %>%
+  left_join(comm2M, by = "RSZ_ID") %>%
+  mutate_at(vars(starts_with("RSZ_")), ~ replace_na(., 0)) %>%
+  left_join(hpiM, by = "CouncilArea2018Code")
+
+write.csv2(PCs, "Final.csv", row.names = F)

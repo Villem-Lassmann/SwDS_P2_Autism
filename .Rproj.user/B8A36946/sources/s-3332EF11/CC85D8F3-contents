@@ -1,0 +1,320 @@
+require("ggplot2")
+require("ggmap") # devtools::install_github("dkahle/ggmap", ref = "tidyup", force=TRUE)
+require("dplyr")
+require("rgeos")
+require("rgdal")
+require("maptools")
+require("broom")
+require("stringr")
+require("gridExtra")
+require("lares") # devtools::install_github("laresbernardo/lares")
+
+options(stringsAsFactors = F)
+
+defw <- 6.78
+defh <- 5.73
+
+##########
+# Data loading and manipulation
+
+pchhM <- read.csv2("Extra Data/pchhM.csv", check.names = F)
+
+# keys <- read.csv("keys.csv", check.names = F, row.names = 1)
+
+final <- read.csv2("Final.csv", check.names = F) %>%
+  rename("Area" = CouncilArea2018Code)
+
+LO <- final %>%
+  select(Postcode) %>%
+  mutate(`In final dataset` = "Yes") %>%
+  full_join(pchhM %>% select(Postcode = `Street postcode`, Longitude, Latitude, Area = CouncilArea2018Code)) %>%
+  mutate(`In final dataset` = replace_na(`In final dataset`, "No"))
+
+bound <- readOGR(dsn="Extra Data", layer = "Local_Authority_Districts__December_2019__Boundaries_UK_BUC") %>%
+  spTransform("+init=epsg:4326")
+bodata <- tidy(bound, region = "lad19cd") %>%
+  filter(str_starts(id, "S")) %>%
+  mutate(id = gsub("S12000050", "S12000044", id),
+         id = gsub("S12000049", "S12000046", id),
+         group = gsub("S12000050", "S12000044", group),
+         group = gsub("S12000049", "S12000046", group))
+
+LO2 <- LO %>%
+  mutate(Kept = `In final dataset` == "Yes") %>%
+  group_by(Area) %>%
+  summarise(`% of PCs kept` = sum(Kept) / n() * 100) %>%
+  full_join(bodata, by = c("Area" = "id"))
+
+finalI <- final %>%
+  select(Postcode, Longitude, Latitude, Area, ScottishIndexOfMultipleDeprivation2016Rank,
+         `Total Samples Num`, `Total Samples Result Median`, GDHIph, Population, `Post 1970 Properties`,
+         `Pre 1970 Properties`, `Indeterminate Properties`, WOA_Name, RSZ_Name, `Any Phosphate Dosing`,
+         `RSZ_Summer_Hydrogen_median`, `RSZ_Summer_Lead_median`, `RSZ_Summer_Phosphorus_median`, `RSZ_Summer_Temperature_median`,
+         `RSZ_Winter_Hydrogen_median`, `RSZ_Winter_Lead_median`, `RSZ_Winter_Phosphorus_median`, `RSZ_Winter_Temperature_median`,
+         `2018_AveragePrice_median`, `RSZ_Pre 1970 pipes`, `RSZ_Pre 1970 reg lead`, `RSZ_Post 1970 pipes`,
+         `RSZ_Post 1970 reg lead`, `RSZ_Pipes tested total`, `RSZ_Pipes tested lead`, `WOA_Pipe replacement jobs total`,
+         `WOA_Pipe replacement jobs complete`)
+
+boPCAgg <- finalI %>%
+  group_by(Area) %>%
+  summarise(`Average Deprivation Rank` = mean(ScottishIndexOfMultipleDeprivation2016Rank),
+            `Number of PCs (log10)` = log(n()),
+            `Lead samples taken` = sum(`Total Samples Num`) / n(),
+            `Average lead sample result (ln)` = mean(`Total Samples Result Median`),
+            `Pre 1970 to post 1970 property ratio` = sum(`Pre 1970 Properties`) / sum(`Post 1970 Properties`)) %>%
+  full_join(bodata, by = c("Area" = "id"))
+
+boAreaL <- finalI %>%
+  select(Area, GDHIph, Population, `2018_AveragePrice_median`) %>%
+  unique() %>%
+  full_join(bodata, by = c("Area" = "id"))
+
+boWOAAgg <- finalI %>%
+  select(Area, WOA_Name, `RSZ_Summer_Hydrogen_median`, `RSZ_Summer_Lead_median`, 
+         `RSZ_Summer_Phosphorus_median`, `RSZ_Summer_Temperature_median`, `RSZ_Winter_Hydrogen_median`, `RSZ_Winter_Lead_median`, 
+         `RSZ_Winter_Phosphorus_median`, `RSZ_Winter_Temperature_median`, `WOA_Pipe replacement jobs total`,
+         `WOA_Pipe replacement jobs complete`) %>%
+  unique() %>%
+  group_by(Area) %>%
+  mutate_at(3:10, ~ mean(.)) %>%
+  mutate_at(11:12, ~ sum(.)) %>%
+  slice(1) %>%
+  mutate(`Jobs complete %` = `WOA_Pipe replacement jobs complete` / `WOA_Pipe replacement jobs total`)
+
+boWOAAgg1 <- boWOAAgg %>%
+  select(-c(2,11:13)) %>%
+  pivot_longer(cols = ends_with("median"), names_to = c("Season", "Object"),
+               names_pattern = "_(.*)_(.*)_median", values_to = "Average") %>%
+  full_join(bodata, by = c("Area" = "id"))
+
+boWOAAgg2 <- boWOAAgg %>%
+  select(1,11,13) %>%
+  full_join(bodata, by = c("Area" = "id"))
+
+corrFinal <- final %>%
+  select_if(is.numeric) %>%
+  select(-Easting, -Northing) %>%
+  filter(complete.cases(.)) %>%
+  select(-ends_with("mad"), -ends_with("kurt"), -ends_with("Galton"), -ends_with("Kurtosis"), -ends_with("Skewness")) %>%
+  rename("Total_Lead" = `Total Samples Result Median`)
+
+corrFinal2 <- corrFinal %>%
+  select(-contains("Price"), -contains("Volume"))
+
+##########
+# Correlation analysis
+
+ggsave("Images/Corr1.png", grid.arrange(corr_cross(corrFinal, top = 10), corr_cross(corrFinal, top = 10, max = 0.0015), nrow = 2),
+       width = defw*1.5, height = defh*1.5)
+
+ggsave("Images/Corr1Max.png", corr_cross(corrFinal, top = 10), width = defw*1.5, height = defh)
+ggsave("Images/Corr1Min.png", corr_cross(corrFinal, top = 10, max = 0.0015), width = defw*1.5, height = defh)
+
+ggsave("Images/Corr2.png", grid.arrange(corr_cross(corrFinal2, top = 10), corr_cross(corrFinal2, top = 10, max = 0.007), nrow = 2),
+       width = defw*1.5, height = defh*1.5)
+
+ggsave("Images/Corr2Max.png", corr_cross(corrFinal2, top = 10), width = defw*1.5, height = defh)
+ggsave("Images/Corr2Min.png", corr_cross(corrFinal2, top = 10, max = 0.007), width = defw*1.5, height = defh)
+
+ggsave("Images/CorrLead.png", grid.arrange(corr_var(corrFinal, var = Total_Lead, top = 10), corr_var(corrFinal, var = Total_Lead, top = 10, ceiling = 4), nrow = 2),
+       width = defw*1.5, height = defh*1.5)
+
+ggsave("Images/CorrLead1.png", corr_var(corrFinal, var = Total_Lead, top = 10), width = defw*1.5, height = defh)
+ggsave("Images/CorrLead2.png", corr_var(corrFinal, var = Total_Lead, top = 10, ceiling = 4), width = defw*1.5, height = defh)
+
+##########
+# Getting base maps
+
+# ggmap::register_google(key = keys["GMaps",1])
+
+x1 <- floor(min(pchhM$Longitude))
+y1 <- floor(min(pchhM$Latitude))
+x2 <- ceiling(max(pchhM$Longitude))
+y2 <- ceiling(max(pchhM$Latitude))
+
+c1 <- c(lon = -4.1471636, lat = 57.4415325)
+c2 <- c(left = -8.5, bottom = 54, right = 0, top = 60)
+c3 <- c(left = x1, bottom = y1, right = x2, top = y2)
+
+# bmp1 <- get_googlemap(c1, zoom = 6, maptype = "roadmap", 
+                         # color = "color", scale = 2) 
+bmp2 <- get_stamenmap(c3, maptype = "toner-lite", zoom = 6, color = "bw")
+bmp2lbls <- get_stamenmap(c3, maptype = "toner-labels", zoom = 6, color = "bw")
+
+# basemap1 <- bmp1 %>% ggmap()
+basemap2 <- bmp2 %>% ggmap()
+
+##########
+# Map plotting
+
+KeptCA <- basemap2 +
+  geom_polygon(data = LO2, aes(x = long, y = lat, group = group, fill = `% of PCs kept`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude")
+  # ggtitle("Percentage of postcodes by Local Authorities in Scotland")
+
+ggsave("Images/KeptCA.png", KeptCA)
+
+pcdens <- basemap2 + stat_density2d(aes(x = Longitude, y = Latitude, fill = ..level.., alpha = 0.01),
+                          size = 1, bins = 50, data = finalI, geom = "polygon", alpha = 0.25) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Density of postcodes in Scotland") +
+  labs(fill = "Density") + 
+  theme(legend.position = "none")
+
+pcpoints <- basemap2 + geom_point(aes(x = Longitude, y = Latitude, fill = "grey"), data = finalI, alpha = 0.05) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Location of postcodes in Scotland") +
+  labs(fill = "Density") + 
+  theme(legend.position = "none")
+
+ggsave("Images/PCDePo.png", grid.arrange(pcpoints,pcdens, ncol = 2))
+
+PCsCA <- basemap2 +
+  geom_polygon(data = boPCAgg, aes(x = long, y = lat, group = group, fill = `Number of PCs (log10)`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude")
+  # ggtitle("Number of postcodes by Local Authorities in Scotland")
+
+ggsave("Images/PCsCA.png", PCsCA)
+
+DRCA <- basemap2 +
+  geom_polygon(data = boPCAgg, aes(x = long, y = lat, group = group, fill = `Average Deprivation Rank`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude")
+  # ggtitle("Average Deprivation Rank by Local Authorities in Scotland")
+
+ggsave("Images/DRCA.png", DRCA)
+
+TLSCA <- basemap2 +
+  geom_polygon(data = boPCAgg, aes(x = long, y = lat, group = group, fill = `Lead samples taken`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Lead samples (per PC) taken by LAs") +
+  labs(fill = "Ratio")
+
+ALSCA <- basemap2 +
+  geom_polygon(data = boPCAgg, aes(x = long, y = lat, group = group, fill = `Average lead sample result (ln)`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Average lead in water (microgram/l) by LAs") +
+  labs(fill = "Result (ln)")
+
+ggsave("Images/TLALSCA.png", grid.arrange(TLSCA, ALSCA, ncol = 2), width = defw*1.5, height = defh)
+
+PRCA <- basemap2 +
+  geom_polygon(data = boPCAgg, aes(x = long, y = lat, group = group, fill = `Pre 1970 to post 1970 property ratio`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Property age ratio by Local Authorities in Scotland") +
+  labs(fill = "Pre to Post 1970 ratio")
+
+ggsave("Images/PRCA.png", PRCA)
+
+GDHICA <- basemap2 +
+  geom_polygon(data = boAreaL, aes(x = long, y = lat, group = group, fill = `GDHIph`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("GDHI per head by LAs") +
+  labs(fill = "GDHI")
+
+PopCA <- basemap2 +
+  geom_polygon(data = boAreaL, aes(x = long, y = lat, group = group, fill = `Population`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Population by LAs") +
+  labs(fill = "Pop")
+
+ggsave("Images/GDHIPopCA.png", grid.arrange(GDHICA, PopCA, ncol = 2), width = defw*1.5, height = defh)
+
+PrCA <- basemap2 +
+  geom_polygon(data = boAreaL, aes(x = long, y = lat, group = group, fill = `2018_AveragePrice_median`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Average price of properties") +
+  labs(fill = "Price")
+
+ggsave("Images/PrCA.png", PrCA)
+
+RepNCA <- basemap2 +
+  geom_polygon(data = boWOAAgg2, aes(x = long, y = lat, group = group, fill = `WOA_Pipe replacement jobs total`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Number of pipe replacement jobs") +
+  labs(fill = "No of jobs")
+
+RepPCA <- basemap2 +
+  geom_polygon(data = boWOAAgg2, aes(x = long, y = lat, group = group, fill = `Jobs complete %`), alpha = 1) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Percentage of completed jobs") +
+  labs(fill = "Complete %")
+
+ggsave("Images/RepCA.png", grid.arrange(RepNCA, RepPCA, ncol = 2), width = defw*1.5, height = defh)
+
+LeadWOACA <- basemap2 +
+  geom_polygon(data = boWOAAgg1 %>% filter(Object == "Lead") , aes(x = long, y = lat, group = group, fill = Average)) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Average lead levels in Regulatory Supply Zones") +
+  labs(fill = "Lead") +
+  facet_wrap( ~ Season)
+
+ggsave("Images/LeadWOACA.png", LeadWOACA, width = defw*1.5, height = defh)
+
+HydroWOACA <- basemap2 +
+  geom_polygon(data = boWOAAgg1 %>% filter(Object == "Hydrogen") , aes(x = long, y = lat, group = group, fill = Average)) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Average hydrogen levels in Regulatory Supply Zones") +
+  labs(fill = "Hydrogen") +
+  facet_wrap( ~ Season)
+
+ggsave("Images/HydroWOACA.png", HydroWOACA, width = defw*1.5, height = defh)
+
+TemperatureWOACA <- basemap2 +
+  geom_polygon(data = boWOAAgg1 %>% filter(Object == "Temperature") , aes(x = long, y = lat, group = group, fill = Average)) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Average temperature levels in Regulatory Supply Zones") +
+  labs(fill = "Temperature") +
+  facet_wrap( ~ Season)
+
+ggsave("Images/TemperatureWOACA.png", TemperatureWOACA, width = defw*1.5, height = defh)
+
+PhosWOACA <- basemap2 +
+  geom_polygon(data = boWOAAgg1 %>% filter(Object == "Phosphorus") , aes(x = long, y = lat, group = group, fill = Average)) +
+  inset_ggmap(bmp2lbls) +
+  scale_fill_continuous(labels = scales::comma) +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  # ggtitle("Average phosphorus levels in Regulatory Supply Zones") +
+  labs(fill = "Phosphorus") +
+  facet_wrap( ~ Season)
+
+ggsave("Images/PhosWOACA.png", PhosWOACA, width = defw*1.5, height = defh)

@@ -1,0 +1,32 @@
+{
+    "id": "572EB66A",
+    "path": null,
+    "project_path": null,
+    "type": "r_dataframe",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1596616415640.0,
+    "source_on_save": false,
+    "relative_order": 7,
+    "properties": {
+        "expression": "mdv",
+        "caption": "mdv",
+        "totalObservations": 89,
+        "displayedObservations": 89,
+        "variables": 36,
+        "cacheKey": "B7A659BE",
+        "object": "mdv",
+        "environment": "",
+        "contentUrl": "grid_resource/gridviewer.html?env=&obj=mdv&cache_key=B7A659BE&max_cols=50",
+        "preview": 0
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1596615089,
+    "encoding": "",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1596616415640,
+    "read_only": false,
+    "read_only_alternatives": []
+}
